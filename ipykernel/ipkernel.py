@@ -17,6 +17,7 @@ import comm
 from IPython.core import release
 from IPython.utils.tokenutil import line_at_cursor, token_at_cursor
 from traitlets import Any, Bool, HasTraits, Instance, List, Type, default, observe, observe_compat
+from traitlets.utils.importstring import import_item
 from zmq.eventloop.zmqstream import ZMQStream
 
 from .comm.comm import BaseComm
@@ -74,9 +75,11 @@ class IPythonKernel(KernelBase):
     shell = Instance("IPython.core.interactiveshell.InteractiveShellABC", allow_none=True)
     shell_class = Type(ZMQInteractiveShell)
 
-    # use fully-qualified name to ensure lazy import and prevent the issue from
-    # https://github.com/ipython/ipykernel/issues/1198
-    debugger_class = Type("ipykernel.debugger.Debugger")
+    # Not a Type() trait: traitlets resolves (and thus imports) a Type
+    # trait's string default as soon as the owning HasTraits instance is
+    # created, which would force the expensive debugpy import on every
+    # kernel startup. Resolved lazily instead, see the `debugger` property.
+    debugger_class_name = "ipykernel.debugger.Debugger"
 
     compiler_class = Type(XCachingCompiler)
 
@@ -117,24 +120,14 @@ class IPythonKernel(KernelBase):
         """Initialize the kernel."""
         super().__init__(**kwargs)
 
-        from .debugger import _is_debugpy_available
-
         self._kernel_modules = [
             m.__file__ for m in sys.modules.copy().values() if hasattr(m, "__file__") and m.__file__
         ]
 
-        # Initialize the Debugger
-        if _is_debugpy_available:
-            self.debugger = self.debugger_class(
-                self.log,
-                self.debugpy_stream,
-                self._publish_debug_event,
-                self.debug_shell_socket,
-                self.session,
-                self._kernel_modules,
-                self.debug_just_my_code,
-                self.filter_internal_frames,
-            )
+        # The debugger itself (and the debugpy import it requires) is
+        # created lazily on first use, see the `debugger` property below.
+        self._debugger = None
+        self._debugger_init_attempted = False
 
         # Initialize the InteractiveShell subclass
         self.shell = self.shell_class.instance(
@@ -216,10 +209,36 @@ class IPythonKernel(KernelBase):
         "file_extension": ".py",
     }
 
-    def dispatch_debugpy(self, msg):
-        from .debugger import _is_debugpy_available
+    @property
+    def debugger(self):
+        """The debugger instance, created lazily on first use.
 
-        if _is_debugpy_available:
+        Importing debugpy is expensive, so we avoid it until a debug
+        request actually comes in.
+        """
+        if self._debugger is None and not self._debugger_init_attempted:
+            self._debugger_init_attempted = True
+            from .debugger import _is_debugpy_available
+
+            if _is_debugpy_available:
+                debugger_class = import_item(self.debugger_class_name)
+                self._debugger = debugger_class(
+                    self.log,
+                    self.debugpy_stream,
+                    self._publish_debug_event,
+                    self.debug_shell_socket,
+                    self.session,
+                    self._kernel_modules,
+                    self.debug_just_my_code,
+                    self.filter_internal_frames,
+                )
+                asyncio.run_coroutine_threadsafe(
+                    self.poll_stopped_queue(), self.control_thread.io_loop.asyncio_loop
+                )
+        return self._debugger
+
+    def dispatch_debugpy(self, msg):
+        if self.debugger is not None:
             # The first frame is the socket id, we can drop it
             frame = msg[1].bytes.decode("utf-8")
             self.log.debug("Debugpy received: %s", frame)
@@ -245,10 +264,6 @@ class IPythonKernel(KernelBase):
         else:
             self.debugpy_stream.on_recv(self.dispatch_debugpy, copy=False)
         super().start()
-        if self.debugpy_stream:
-            asyncio.run_coroutine_threadsafe(
-                self.poll_stopped_queue(), self.control_thread.io_loop.asyncio_loop
-            )
 
     def set_parent(self, ident, parent, channel="shell"):
         """Overridden from parent to tell the display hook and output streams
@@ -535,9 +550,7 @@ class IPythonKernel(KernelBase):
 
     async def do_debug_request(self, msg):
         """Handle a debug request."""
-        from .debugger import _is_debugpy_available
-
-        if _is_debugpy_available:
+        if self.debugger is not None:
             return await self.debugger.process_request(msg)
         return None
 
