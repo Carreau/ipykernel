@@ -252,12 +252,17 @@ class IPythonKernel(KernelBase):
         request actually comes in.
         """
         if self._debugger is None and not self._debugger_init_attempted:
-            self._debugger_init_attempted = True
             from .debugger import _is_debugpy_available
 
-            if _is_debugpy_available:
-                debugger_class = self.debugger_class
-                self._debugger = debugger_class(
+            if not _is_debugpy_available:
+                # A module-level constant: it will not become True later, so
+                # this is the one answer worth caching.
+                self._debugger_init_attempted = True
+                return None
+
+            debugger_class = self.debugger_class
+            try:
+                debugger = debugger_class(
                     self.log,
                     self.debugpy_stream,
                     self._publish_debug_event,
@@ -267,7 +272,17 @@ class IPythonKernel(KernelBase):
                     self.debug_just_my_code,
                     self.filter_internal_frames,
                 )
-                self._ensure_stopped_queue_poll()
+            except Exception:
+                # Deliberately do not set `_debugger_init_attempted`: a
+                # failure here must not silently turn every later debug
+                # request into a `None` reply. Let it raise (so the request
+                # gets a proper error reply) and retry next time.
+                self.log.exception("Failed to initialize the debugger from %r", debugger_class)
+                raise
+
+            self._debugger = debugger
+            self._debugger_init_attempted = True
+            self._ensure_stopped_queue_poll()
         return self._debugger
 
     @debugger.setter

@@ -288,3 +288,31 @@ def test_assigned_debugger_gets_its_stopped_queue_polled(ipkernel, monkeypatch) 
     # Idempotent: reassigning does not stack up a second poll task.
     ipkernel.debugger = fake.__new__(fake)
     assert len(scheduled) == 1
+
+
+def test_debugger_init_failure_is_neither_sticky_nor_silent(ipkernel, caplog) -> None:
+    """A failing debugger class must not silently disable debugging forever."""
+    from ipykernel.debugger import Debugger
+
+    attempts = []
+
+    class BrokenDebugger(Debugger):
+        def __init__(self, *args):
+            attempts.append(args)
+            msg = "boom"
+            raise RuntimeError(msg)
+
+    ipkernel.debugger_class = BrokenDebugger
+
+    with pytest.raises(RuntimeError, match="boom"):
+        _ = ipkernel.debugger
+    assert "Failed to initialize the debugger" in caplog.text
+
+    # Not sticky: a second request retries rather than quietly returning None.
+    with pytest.raises(RuntimeError, match="boom"):
+        _ = ipkernel.debugger
+    assert len(attempts) == 2
+
+    # And it recovers once the cause is gone.
+    ipkernel.debugger_class = fake_debugger_class()
+    assert isinstance(ipkernel.debugger, ipkernel.debugger_class)
