@@ -74,7 +74,6 @@ def _get_psutil() -> t.Any | None:
     """
     global psutil, _NO_SUCH_PROCESS, _psutil_import_attempted  # noqa: PLW0603
     if not _psutil_import_attempted:
-        _psutil_import_attempted = True
         try:
             import psutil as _psutil
         except ImportError:
@@ -82,6 +81,10 @@ def _get_psutil() -> t.Any | None:
         else:
             psutil = _psutil
             _NO_SUCH_PROCESS = (psutil.NoSuchProcess,)
+        # Set last: an import raising something other than ImportError leaves
+        # the flag clear so the next caller retries rather than silently
+        # getting None forever.
+        _psutil_import_attempted = True
     return psutil
 
 
