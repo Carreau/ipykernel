@@ -10,7 +10,6 @@ import signal
 import sys
 import threading
 import typing as t
-import warnings
 from contextlib import contextmanager
 from functools import partial
 
@@ -18,7 +17,6 @@ import comm
 from IPython.core import release
 from IPython.utils.tokenutil import line_at_cursor, token_at_cursor
 from traitlets import Any, Bool, HasTraits, Instance, List, Type, default, observe, observe_compat
-from traitlets.utils.importstring import import_item
 from zmq.eventloop.zmqstream import ZMQStream
 
 from .comm.comm import BaseComm
@@ -70,21 +68,44 @@ comm.create_comm = _create_comm
 comm.get_comm_manager = _get_comm_manager
 
 
+class LazyType(Type):  # type:ignore[type-arg]
+    """A :class:`~traitlets.Type` trait that does not import its default eagerly.
+
+    ``Type.instance_init`` resolves a string ``klass``/``default_value`` — that
+    is, imports it — as soon as the owning :class:`~traitlets.HasTraits` object
+    is created. For a default like ``"ipykernel.debugger.Debugger"`` that means
+    paying for the debugpy import on every kernel startup, even though most
+    sessions never debug.
+
+    This subclass defers the resolution to the first read or write of the
+    trait, which is the point where the class is actually needed. It is
+    otherwise a plain ``Type``: assignment, ``klass`` validation and config all
+    behave identically.
+    """
+
+    def instance_init(self, obj):
+        """Deliberately does not resolve; see the class docstring."""
+
+    def default(self, obj=None):
+        self._resolve_classes()
+        return super().default(obj)
+
+    def validate(self, obj, value):
+        self._resolve_classes()
+        return super().validate(obj, value)
+
+
 class IPythonKernel(KernelBase):
     """The IPython Kernel class."""
 
     shell = Instance("IPython.core.interactiveshell.InteractiveShellABC", allow_none=True)
     shell_class = Type(ZMQInteractiveShell)
 
-    # Do not use a Type() trait: traitlets resolves (and thus imports) a Type
-    # trait's string default as soon as the owning HasTraits instance is
-    # created, which would force the expensive debugpy import on every
-    # kernel startup. Resolved lazily instead, see the `debugger` property.
-    debugger_class_name = "ipykernel.debugger.Debugger"
-
-    # Set by the deprecated `debugger_class` setter, takes precedence over
-    # `debugger_class_name` when not None.
-    _debugger_class: type | None = None
+    # LazyType rather than Type: a plain Type would import the debugger (and so
+    # debugpy) as soon as the kernel is instantiated. Reading or setting
+    # `debugger_class` resolves it, exactly as before; simply never touching it
+    # now costs nothing. See also the `debugger` property.
+    debugger_class = LazyType("ipykernel.debugger.Debugger")
 
     compiler_class = Type(XCachingCompiler)
 
@@ -133,6 +154,14 @@ class IPythonKernel(KernelBase):
         # created lazily on first use, see the `debugger` property below.
         self._debugger = None
         self._debugger_init_attempted = False
+
+        if "debugger_class" in self._trait_values:
+            # Someone explicitly picked a debugger class, via kwargs or config.
+            # The class is therefore already imported, so there is nothing left
+            # to defer: build the debugger now, as pre-7.4 versions did. This
+            # also keeps the failure mode of a bad `debugger_class` at
+            # construction time rather than at the first debug request.
+            _ = self.debugger
 
         # Initialize the InteractiveShell subclass
         self.shell = self.shell_class.instance(
@@ -215,60 +244,6 @@ class IPythonKernel(KernelBase):
     }
 
     @property
-    def debugger_class(self):
-        """Deprecated, use :attr:`debugger_class_name` instead.
-
-        .. deprecated:: 7.4
-            Accessing this attribute imports the debugger module (and thus
-            debugpy), which is exactly what ``debugger_class_name`` exists to
-            avoid.
-        """
-        warnings.warn(
-            "IPythonKernel.debugger_class is deprecated in ipykernel 7.4,"
-            " use IPythonKernel.debugger_class_name instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return self._resolve_debugger_class()
-
-    @debugger_class.setter
-    def debugger_class(self, value):
-        warnings.warn(
-            "IPythonKernel.debugger_class is deprecated in ipykernel 7.4,"
-            " set IPythonKernel.debugger_class_name to the fully qualified"
-            " name of the class instead.",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        self._debugger_class = value
-
-    def _resolve_debugger_class(self):
-        """Return the class to instantiate the debugger from.
-
-        Honors the deprecated ``debugger_class`` attribute, whether it was set
-        on an instance or overridden by a subclass, before falling back to
-        ``debugger_class_name``.
-        """
-        if self._debugger_class is not None:
-            return self._debugger_class
-        for klass in type(self).__mro__:
-            if klass is IPythonKernel:
-                break
-            if "debugger_class" in klass.__dict__:
-                warnings.warn(
-                    f"{klass.__module__}.{klass.__qualname__} overrides"
-                    " `debugger_class`, which is deprecated in ipykernel 7.4;"
-                    " override `debugger_class_name` with the fully qualified"
-                    " name of the class instead.",
-                    DeprecationWarning,
-                    stacklevel=3,
-                )
-                # The subclass attribute shadows the property defined here, so
-                # this resolves the override (a plain class or a Type trait).
-                return self.debugger_class
-        return import_item(self.debugger_class_name)
-
-    @property
     def debugger(self):
         """The debugger instance, created lazily on first use.
 
@@ -280,7 +255,7 @@ class IPythonKernel(KernelBase):
             from .debugger import _is_debugpy_available
 
             if _is_debugpy_available:
-                debugger_class = self._resolve_debugger_class()
+                debugger_class = self.debugger_class
                 self._debugger = debugger_class(
                     self.log,
                     self.debugpy_stream,

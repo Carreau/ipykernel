@@ -211,3 +211,57 @@ async def test_do_debug_request(ipkernel: IPythonKernel) -> None:
     msg = ipkernel.session.msg("debug_request", {})
     ipkernel.session.serialize(msg)
     await ipkernel.do_debug_request(msg)
+
+
+# The `debugger` property short-circuits to None without debugpy, and
+# `debugger_class` validates against the real Debugger, so these need it.
+debugpy = pytest.importorskip("debugpy", reason="debugpy is not installed")
+
+
+def fake_debugger_class(record=None):
+    """A Debugger subclass that records its args instead of touching debugpy."""
+    from ipykernel.debugger import Debugger
+
+    class FakeDebugger(Debugger):
+        def __init__(self, *args):
+            if record is not None:
+                record.append(args)
+            self.args = args
+
+    return FakeDebugger
+
+
+def test_debugger_class_is_still_a_trait() -> None:
+    """Subclasses and callers that set `debugger_class` must keep working."""
+    assert IPythonKernel.class_traits()["debugger_class"] is not None
+
+    fake = fake_debugger_class()
+    kernel = MockIPyKernel(debugger_class=fake)
+    assert kernel.debugger_class is fake
+    # Explicitly chosen, so built eagerly: the class is already imported.
+    assert isinstance(kernel._debugger, fake)
+    kernel.destroy()
+
+
+def test_debugger_class_default_is_lazy() -> None:
+    """Merely creating a kernel must not resolve the default debugger class."""
+    kernel = MockIPyKernel()
+    assert "debugger_class" not in kernel._trait_values
+    assert kernel._debugger is None
+
+    from ipykernel.debugger import Debugger
+
+    assert kernel.debugger_class is Debugger
+    kernel.destroy()
+
+
+def test_debugger_class_subclass_override() -> None:
+    fake = fake_debugger_class()
+
+    class MyKernel(MockIPyKernel):
+        debugger_class = fake
+
+    kernel = MyKernel()
+    assert kernel.debugger_class is fake
+    assert isinstance(kernel.debugger, fake)
+    kernel.destroy()
