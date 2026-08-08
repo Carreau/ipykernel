@@ -2,10 +2,12 @@
 
 import asyncio
 import os
+from unittest import mock
 
 import pytest
 import zmq
 from IPython.core.history import DummyDB
+from zmq.eventloop.zmqstream import ZMQStream
 
 from ipykernel.comm.comm import BaseComm
 from ipykernel.ipkernel import IPythonKernel, _create_comm
@@ -265,3 +267,24 @@ def test_debugger_class_subclass_override() -> None:
     assert kernel.debugger_class is fake
     assert isinstance(kernel.debugger, fake)
     kernel.destroy()
+
+
+def test_assigned_debugger_gets_its_stopped_queue_polled(ipkernel, monkeypatch) -> None:
+    """Assigning `kernel.debugger` must not skip the poll_stopped_queue task."""
+    scheduled = []
+    monkeypatch.setattr(
+        "ipykernel.ipkernel.asyncio.run_coroutine_threadsafe",
+        lambda coro, loop: scheduled.append(coro) or coro.close(),
+    )
+
+    # The poll needs something to poll from and a loop to run on.
+    ipkernel.debugpy_stream = mock.MagicMock(spec=ZMQStream)
+    ipkernel.control_thread = mock.MagicMock()
+
+    fake = fake_debugger_class()
+    ipkernel.debugger = fake.__new__(fake)
+    assert len(scheduled) == 1
+
+    # Idempotent: reassigning does not stack up a second poll task.
+    ipkernel.debugger = fake.__new__(fake)
+    assert len(scheduled) == 1

@@ -154,6 +154,7 @@ class IPythonKernel(KernelBase):
         # created lazily on first use, see the `debugger` property below.
         self._debugger = None
         self._debugger_init_attempted = False
+        self._stopped_queue_poll_started = False
 
         if "debugger_class" in self._trait_values:
             # Someone explicitly picked a debugger class, via kwargs or config.
@@ -266,13 +267,7 @@ class IPythonKernel(KernelBase):
                     self.debug_just_my_code,
                     self.filter_internal_frames,
                 )
-                # Mirrors the guard that used to live in `start()`: without a
-                # debugpy stream or a control thread there is nothing to poll
-                # on, and no loop to poll from.
-                if self.debugpy_stream is not None and self.control_thread is not None:
-                    asyncio.run_coroutine_threadsafe(
-                        self.poll_stopped_queue(), self.control_thread.io_loop.asyncio_loop
-                    )
+                self._ensure_stopped_queue_poll()
         return self._debugger
 
     @debugger.setter
@@ -281,6 +276,28 @@ class IPythonKernel(KernelBase):
         # __init__; keep it writable for subclasses that replace it.
         self._debugger = value
         self._debugger_init_attempted = True
+        if value is not None:
+            # A debugger assigned after `start()` still needs its stopped
+            # events pumped; before `start()` this no-ops and `start()`
+            # picks it up.
+            self._ensure_stopped_queue_poll()
+
+    def _ensure_stopped_queue_poll(self):
+        """Schedule `poll_stopped_queue` once, as soon as it can run.
+
+        Called both when the debugger is created (or assigned) and from
+        `start()`, because either can come first: the poll needs a debugger to
+        pump, a debugpy stream to pump from, and the control thread's loop to
+        run on.
+        """
+        if self._stopped_queue_poll_started or self._debugger is None:
+            return
+        if self.debugpy_stream is None or self.control_thread is None:
+            return
+        self._stopped_queue_poll_started = True
+        asyncio.run_coroutine_threadsafe(
+            self.poll_stopped_queue(), self.control_thread.io_loop.asyncio_loop
+        )
 
     def dispatch_debugpy(self, msg):
         if self.debugger is not None:
@@ -309,6 +326,11 @@ class IPythonKernel(KernelBase):
         else:
             self.debugpy_stream.on_recv(self.dispatch_debugpy, copy=False)
         super().start()
+        # Deliberately checks `_debugger` rather than the `debugger` property:
+        # a kernel that has not needed the debugger yet must not import debugpy
+        # just to start. If the debugger appears later, its own setter/lazy
+        # init schedules the poll.
+        self._ensure_stopped_queue_poll()
 
     def set_parent(self, ident, parent, channel="shell"):
         """Overridden from parent to tell the display hook and output streams
